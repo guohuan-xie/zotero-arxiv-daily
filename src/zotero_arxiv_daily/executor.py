@@ -3,8 +3,9 @@ from pyzotero import zotero
 from omegaconf import DictConfig, ListConfig
 from .utils import glob_match
 from .retriever import get_retriever_cls
-from .protocol import CorpusPaper
+from .protocol import CorpusPaper, _request_llm
 import random
+import re
 from datetime import datetime
 from .reranker import get_reranker_cls
 from .construct_email import render_email
@@ -89,6 +90,78 @@ class Executor:
             logger.info(f"Selected {len(corpus)} zotero papers:\n{samples}\n...")
         return corpus
 
+    def score_paper_quality(self, paper) -> float | None:
+        """Score methodological quality from 0 to 10 using a strict LLM review."""
+        paper_text = (
+            f"Title: {paper.title}\n\n"
+            f"Abstract: {paper.abstract or ''}\n\n"
+            f"Main-content preview: {(paper.full_text or '')[:6000]}"
+        )
+        prompt = (
+            "Assess the overall scientific quality of this newly posted paper. "
+            "Use a strict 0-10 scale and consider methodological rigor (30%), "
+            "strength and completeness of empirical evidence (25%), novelty and "
+            "potential significance (25%), and clarity/reproducibility (20%). "
+            "Do not reward buzzwords, author identity, or institutional prestige. "
+            "Penalize vague claims, weak comparisons, missing evidence, and "
+            "unclear contributions. A score of 7.5 or above should be reserved "
+            "for papers that appear genuinely strong from the available evidence. "
+            "Return only one numeric score from 0 to 10.\n\n"
+            + paper_text
+        )
+        try:
+            response = _request_llm(
+                self.openai_client,
+                self.config.llm,
+                [
+                    {
+                        "role": "system",
+                        "content": "You are a strict and conservative scientific peer reviewer.",
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+            )
+            match = re.search(r"\b(?:10(?:\.0+)?|[0-9](?:\.\d+)?)\b", response.strip())
+            if match is None:
+                raise ValueError(f"Cannot parse quality score from response: {response!r}")
+            score = min(10.0, max(0.0, float(match.group(0))))
+            logger.info(f"Quality score {score:.1f}/10 for {paper.title}")
+            return score
+        except Exception as e:
+            logger.warning(f"Failed to assess quality of {paper.url}: {e}")
+            return None
+
+    def filter_high_quality_papers(self, papers):
+        """Keep only papers that clear a configurable, conservative quality bar."""
+        max_paper_num = int(self.config.executor.max_paper_num)
+        if not self.config.executor.get("quality_filter", True):
+            return papers[:max_paper_num]
+
+        min_score = float(self.config.executor.get("min_quality_score", 7.5))
+        candidate_num = int(
+            self.config.executor.get(
+                "quality_candidate_num",
+                max(20, max_paper_num * 3),
+            )
+        )
+        selected = []
+        logger.info(
+            f"Strict quality screening enabled: threshold={min_score:.1f}/10, "
+            f"candidates={min(candidate_num, len(papers))}"
+        )
+        for paper in tqdm(papers[:candidate_num], desc="Quality screening"):
+            score = self.score_paper_quality(paper)
+            if score is not None and score >= min_score:
+                paper.quality_score = score
+                selected.append(paper)
+                if len(selected) >= max_paper_num:
+                    break
+        logger.info(
+            f"Selected {len(selected)} high-quality papers from "
+            f"{min(candidate_num, len(papers))} candidates"
+        )
+        return selected
+
     
     def run(self):
         corpus = self.fetch_zotero_corpus()
@@ -126,7 +199,10 @@ class Executor:
         if len(all_papers) > 0:
             logger.info("Reranking papers...")
             reranked_papers = self.reranker.rerank(all_papers, corpus)
-            reranked_papers = reranked_papers[:self.config.executor.max_paper_num]
+            reranked_papers = self.filter_high_quality_papers(reranked_papers)
+            if len(reranked_papers) == 0 and not self.config.executor.send_empty:
+                logger.info("No papers passed the quality threshold. No email will be sent.")
+                return
             logger.info("Generating TLDR and affiliations...")
             for p in tqdm(reranked_papers):
                 p.generate_tldr(self.openai_client, self.config.llm)
