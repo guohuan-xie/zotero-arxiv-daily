@@ -94,8 +94,24 @@ class Executor:
         corpus = self.fetch_zotero_corpus()
         corpus = self.filter_corpus(corpus)
         if len(corpus) == 0:
-            logger.error(f"No zotero papers found. Please check your zotero settings:\n{self.config.zotero}")
-            return
+            logger.warning(
+                "No Zotero papers with abstracts were found; using a "
+                "video-generation research profile as the recommendation seed."
+            )
+            corpus = [
+                CorpusPaper(
+                    title="Video generation research profile",
+                    abstract=(
+                        "Research on generative video models, including text-to-video and "
+                        "image-to-video generation, diffusion transformers, controllable "
+                        "generation, motion control, temporal consistency, world models, "
+                        "video editing, personalization, stylized video generation, and "
+                        "efficient training and inference."
+                    ),
+                    added_date=datetime.now(),
+                    paths=["configured-interest/video-generation"],
+                )
+            ]
         all_papers = []
         for source, retriever in self.retrievers.items():
             logger.info(f"Retrieving {source} papers...")
