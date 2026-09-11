@@ -132,10 +132,15 @@ class Executor:
             return None
 
     def filter_high_quality_papers(self, papers):
-        """Keep only papers that clear a configurable, conservative quality bar."""
+        """Apply a strict quality bar, then backfill the best papers to a minimum."""
         max_paper_num = int(self.config.executor.max_paper_num)
+        min_paper_num = min(
+            int(self.config.executor.get("min_paper_num", 5)),
+            max_paper_num,
+            len(papers),
+        )
         if not self.config.executor.get("quality_filter", True):
-            return papers[:max_paper_num]
+            return papers[:max(max_paper_num, min_paper_num)]
 
         min_score = float(self.config.executor.get("min_quality_score", 7.5))
         candidate_num = int(
@@ -145,22 +150,48 @@ class Executor:
             )
         )
         selected = []
+        reviewed = []
         logger.info(
             f"Strict quality screening enabled: threshold={min_score:.1f}/10, "
-            f"candidates={min(candidate_num, len(papers))}"
+            f"minimum={min_paper_num}, candidates={min(candidate_num, len(papers))}"
         )
-        for paper in tqdm(papers[:candidate_num], desc="Quality screening"):
+        for index, paper in enumerate(
+            tqdm(papers[:candidate_num], desc="Quality screening")
+        ):
             score = self.score_paper_quality(paper)
+            reviewed.append((score if score is not None else -1.0, index, paper))
             if score is not None and score >= min_score:
                 paper.quality_score = score
                 selected.append(paper)
                 if len(selected) >= max_paper_num:
                     break
+
+        high_quality_count = len(selected)
+        if len(selected) < min_paper_num:
+            selected_ids = {id(paper) for paper in selected}
+            fallback = sorted(
+                reviewed,
+                key=lambda item: (item[0], -item[1]),
+                reverse=True,
+            )
+            for score, _, paper in fallback:
+                if id(paper) in selected_ids:
+                    continue
+                paper.quality_score = None if score < 0 else score
+                selected.append(paper)
+                selected_ids.add(id(paper))
+                if len(selected) >= min_paper_num:
+                    break
+            logger.info(
+                f"Only {high_quality_count} papers met the {min_score:.1f}/10 "
+                f"threshold; backfilled the best available papers to {len(selected)}."
+            )
+
         logger.info(
-            f"Selected {len(selected)} high-quality papers from "
-            f"{min(candidate_num, len(papers))} candidates"
+            f"Selected {len(selected)} papers "
+            f"({high_quality_count} passed the strict quality threshold)"
         )
-        return selected
+        return selected[:max_paper_num]
 
     
     def run(self):
